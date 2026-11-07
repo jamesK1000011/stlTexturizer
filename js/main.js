@@ -5,7 +5,7 @@
 
 import * as THREE from 'three';
 import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWireframe,
-         getControls, getCamera, getCurrentMesh,
+         getControls, getCamera, getCurrentMesh, getRenderer, getScene,
          setExclusionOverlay, setHoverPreview, setViewerTheme,
          setProjection, requestRender,
          clearDiagOverlays, setDiagEdges, addDiagFaces,
@@ -30,7 +30,7 @@ import { exportSTL, export3MF } from './exporter.js';
 import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
 import { buildSoftExclusion, softPaintedFaces } from './softMask.js';
-import { PaintTree } from './paintTree.js';
+import { PaintTree, distSqPointToTri } from './paintTree.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions } from './meshValidation.js';
 import { t, tHtml, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
@@ -7432,3 +7432,500 @@ window.addEventListener('keydown', (e) => {
 _restoreSessionSettings();
 _baselineSnapshot = _captureUndoSnapshot();
 _updateUndoButtons();
+
+// ── Agent link (bumpmesh-mcp) ────────────────────────────────────────────────
+// SPDX-License-Identifier: AGPL-3.0-only
+// Local fork addition: commands an AI agent can run through bumpmesh-mcp, a
+// local MCP server that serves this page and talks to it over a WebSocket.
+// The commands live here, inside main.js, because they need the module's
+// private state (settings, layers, paintTree, …). The socket itself is in
+// js/agentBridge.js and is only loaded when the page was opened from a pairing
+// link (#agent=<port>:<token>) or has been paired before.
+
+const _agentLog = [];      // alerts raised while the agent drives the page
+const _agentWait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function _agentNote(kind, text) {
+  _agentLog.push({ t: Date.now(), kind, text: String(text) });
+  if (_agentLog.length > 50) _agentLog.shift();
+}
+
+function _agentBusy() {
+  return {
+    exporting: isExporting,
+    baking: isBaking,
+    previewBuilding: !!(settings.useDisplacement && dispPreviewEdgeInfo && dispPreviewEdgeInfo.edge == null),
+  };
+}
+
+async function _agentIdle(timeoutMs = 120_000) {
+  const t0 = Date.now();
+  await _agentWait(50);
+  while (Date.now() - t0 < timeoutMs) {
+    const b = _agentBusy();
+    if (!b.exporting && !b.baking && !b.previewBuilding) return true;
+    await _agentWait(100);
+  }
+  return false;
+}
+
+function _agentToWork([x, y, z]) {
+  // Working space = R · original + t (see _restoreOriginalPose).
+  const v = new THREE.Vector3(x, y, z).applyQuaternion(currentPoseRot);
+  return v.add(currentPoseTrans);
+}
+
+function _agentFromWork(v) {
+  const t = currentPoseTrans;
+  return new THREE.Vector3(v.x - t.x, v.y - t.y, v.z - t.z).applyQuaternion(currentPoseRot.clone().invert());
+}
+
+function _agentBoundsOriginal() {
+  if (!currentGeometry) return null;
+  const pos = currentGeometry.attributes.position.array;
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.length; i += 3) {
+    const o = _agentFromWork(v.set(pos[i], pos[i + 1], pos[i + 2]));
+    const a = [o.x, o.y, o.z];
+    for (let k = 0; k < 3; k++) { if (a[k] < min[k]) min[k] = a[k]; if (a[k] > max[k]) max[k] = a[k]; }
+  }
+  const r = (n) => Math.round(n * 1000) / 1000;
+  return { min: min.map(r), max: max.map(r), size: max.map((m, k) => r(m - min[k])) };
+}
+
+function _agentLayers() {
+  return layers.map((L, i) => {
+    const active = i === activeLayer;
+    const entry = active ? activeMapEntry : (L.mapEntry || null);
+    const slot = paintTree ? paintTree.layerSlot(L.id) : -1;
+    let paintedFaces = 0;
+    if (slot >= 0 && paintTree) {
+      try { paintedFaces = _legacyMaskOf(slot)?.excluded.length ?? 0; } catch { paintedFaces = 0; }
+    }
+    return {
+      index: i,
+      active,
+      texture: entry?.name ?? L.mapName ?? null,
+      maskMode: (active ? selectionMode : !!L.includeOnly) ? 'include' : 'exclude',
+      paintedFaces,
+      visible: L.visible,
+      blend: L.blendAdd ? 'add' : 'cover',
+    };
+  });
+}
+
+function _agentStatus() {
+  return {
+    app: 'BumpMesh (agent fork)',
+    version: APP_VERSION,
+    model: currentGeometry ? {
+      name: currentStlName + (currentStlExt || ''),
+      triangles: getTriangleCount(currentGeometry),
+      bounds: _agentBoundsOriginal(),
+    } : null,
+    texture: activeMapEntry?.name ?? null,
+    layers: _agentLayers(),
+    preview3d: !!settings.useDisplacement,
+    busy: _agentBusy(),
+    ...(isExporting ? { exportProgress: `${exportProgLbl.textContent} ${exportProgPct.textContent}`.trim() } : {}),
+    canExport: !!(currentGeometry && _hasTexturedLayer()),
+    notices: _agentLog.slice(-10),
+  };
+}
+
+// The settings an agent may change: the snapshot's own keys, minus those
+// that only describe the UI.
+const _AGENT_SETTING_DOC = {
+  mappingMode: 'projection: 0 planar XY, 1 planar XZ, 2 planar YZ, 3 cylindrical, 4 spherical, 5 triplanar (default), 6 cubic, 7 surface normal (stamp only), 8 outline wrap',
+  scaleU: 'texture tile width in mm (one repeat)',
+  scaleV: 'texture tile height in mm',
+  lockScale: 'keep scaleV equal to scaleU',
+  offsetU: 'texture offset U (0–1 of a tile)',
+  offsetV: 'texture offset V (0–1 of a tile)',
+  rotation: 'texture rotation, degrees',
+  rotateAroundZ: 'triplanar/cubic: rotate side projections around Z',
+  textureHeight: 'displacement depth in mm (the "Amplitude" field)',
+  invertDisplacement: 'push the texture inward instead of outward',
+  invertTexture: 'invert the heightmap (white↔black)',
+  textureSmoothing: 'blur the heightmap, 0 = off',
+  symmetricDisplacement: 'displace both in and out around the surface',
+  mappingBlend: 'triplanar seam blend 0–1',
+  seamBandWidth: 'triplanar seam band width',
+  capAngle: 'cylindrical: angle (deg) above which faces count as caps',
+  boundaryFalloff: 'mm over which displacement ramps in at mask edges',
+  boundaryFalloffCurve: "'linear' | 'scurve' | 'ease'",
+  bottomAngleLimit: 'leave faces within this many degrees of facing down untextured (0 = off)',
+  topAngleLimit: 'leave faces within this many degrees of facing up untextured (0 = off)',
+  refineLength: 'output resolution: target edge length in mm (smaller = finer, more triangles)',
+  maxTriangles: 'triangle budget for the exported mesh',
+  noDownwardZ: 'never displace downward (keeps the print bed face flat)',
+  smoothBottom: 'snap the bottom flat',
+  harvestFlatFaces: 'keep large flat faces as few triangles',
+  preserveUntextured: 'leave untextured faces untouched in the output',
+  stampOnce: 'show the image once (stamp) instead of tiling — a logo or label, scaleU × scaleV mm',
+  stampCenterX: 'stamp centre X, mm in the model file\'s coordinates (null = middle)',
+  stampCenterY: 'stamp centre Y, mm',
+  stampCenterZ: 'stamp centre Z, mm',
+  stampSide: 'stamp: which side along the projection axis, 1 (+) or -1 (−); planar YZ projects along X, XZ along Y, XY along Z',
+  stampNormalX: 'surface-normal stamp (mappingMode 7): the surface normal at the centre, X',
+  stampNormalY: 'surface-normal stamp: normal Y',
+  stampNormalZ: 'surface-normal stamp: normal Z',
+  cylinderCenterX: 'cylindrical axis X, mm in the model file\'s coordinates (null = auto)',
+  cylinderCenterY: 'cylindrical axis Y, mm (null = auto)',
+  cylinderRadius: 'cylindrical radius (null = auto)',
+};
+
+// Points the agent gives in the model file's frame, kept in the app's
+// working frame (the model centred, any in-app rotation applied).
+function _agentPointsIn(changes) {
+  const out = { ...changes };
+  const sc = ['stampCenterX', 'stampCenterY', 'stampCenterZ'];
+  if (sc.some((k) => k in changes)) {
+    const cur = _agentPointsOut(settings);
+    const o = sc.map((k, i) => (k in changes ? changes[k] : cur[k]));
+    if (o.every((v) => v != null)) {
+      const w = _agentToWork(o);
+      out.stampCenterX = w.x; out.stampCenterY = w.y; out.stampCenterZ = w.z;
+    }
+  }
+  if ('cylinderCenterX' in changes || 'cylinderCenterY' in changes) {
+    const cur = _agentPointsOut(settings);
+    const x = 'cylinderCenterX' in changes ? changes.cylinderCenterX : cur.cylinderCenterX;
+    const y = 'cylinderCenterY' in changes ? changes.cylinderCenterY : cur.cylinderCenterY;
+    if (x != null && y != null) {
+      const w = _agentToWork([x, y, 0]);
+      out.cylinderCenterX = w.x; out.cylinderCenterY = w.y;
+    }
+  }
+  const sn = ['stampNormalX', 'stampNormalY', 'stampNormalZ'];
+  if (sn.every((k) => changes[k] != null)) {
+    const n = new THREE.Vector3(changes.stampNormalX, changes.stampNormalY, changes.stampNormalZ).applyQuaternion(currentPoseRot);
+    out.stampNormalX = n.x; out.stampNormalY = n.y; out.stampNormalZ = n.z;
+  }
+  return out;
+}
+
+/** The settings' points back in the model file's frame. */
+function _agentPointsOut(snap) {
+  const out = {};
+  if (snap.stampCenterX != null && snap.stampCenterY != null && snap.stampCenterZ != null) {
+    const o = _agentFromWork(new THREE.Vector3(snap.stampCenterX, snap.stampCenterY, snap.stampCenterZ));
+    out.stampCenterX = +o.x.toFixed(4); out.stampCenterY = +o.y.toFixed(4); out.stampCenterZ = +o.z.toFixed(4);
+  }
+  if (snap.cylinderCenterX != null && snap.cylinderCenterY != null) {
+    const o = _agentFromWork(new THREE.Vector3(snap.cylinderCenterX, snap.cylinderCenterY, 0));
+    out.cylinderCenterX = +o.x.toFixed(4); out.cylinderCenterY = +o.y.toFixed(4);
+  }
+  return out;
+}
+
+function _agentSettings() {
+  const snap = getSettingsSnapshot();
+  const out = {};
+  for (const k of Object.keys(_AGENT_SETTING_DOC)) out[k] = snap[k] ?? null;
+  return { ...out, ...(currentGeometry ? _agentPointsOut(snap) : {}) };
+}
+
+async function _agentSetSettings(changes) {
+  if (!changes || typeof changes !== 'object') throw new Error('settings must be an object');
+  const unknown = Object.keys(changes).filter((k) => !(k in _AGENT_SETTING_DOC) && k !== 'amplitude');
+  if (unknown.length) throw new Error(`Unknown setting(s): ${unknown.join(', ')}. Known: ${Object.keys(_AGENT_SETTING_DOC).join(', ')}`);
+  if ('amplitude' in changes && !('textureHeight' in changes)) changes.textureHeight = changes.amplitude;
+  delete changes.amplitude;
+  if (currentGeometry) changes = _agentPointsIn(changes);
+  const snap = getSettingsSnapshot();
+  Object.assign(snap, changes);
+  // The active layer's record mirrors the top level; keep them the same.
+  const L = snap.layers?.[snap.activeLayer];
+  if (L) for (const k of Object.keys(changes)) if (k in L.settings) L.settings[k] = changes[k];
+  applySettingsSnapshot(snap);
+  _storeActiveLayer();
+  updatePreview();
+  _autoSaveSettings();
+  _scheduleUndoCapture();
+  await _agentIdle();
+  return _agentSettings();
+}
+
+function _agentTextures({ category, search } = {}) {
+  const q = (search || '').toLowerCase();
+  return IMAGE_PRESETS
+    .filter((p) => (!category || p.category === category) && (!q || p.name.toLowerCase().includes(q)))
+    .map((p) => ({ name: p.name, category: p.category, defaultTileFraction: p.defaultScale }));
+}
+
+async function _agentSetTexture({ name, imageUrl, imageName, keepScale }) {
+  if (!currentGeometry) throw new Error('Load a model first.');
+  if (name) {
+    const idx = IMAGE_PRESETS.findIndex((p) => p.name.toLowerCase() === String(name).toLowerCase());
+    if (idx < 0) throw new Error(`No preset texture named "${name}". Use list_textures.`);
+    await selectPreset(idx, !keepScale);
+  } else if (imageUrl) {
+    const res = await fetch(imageUrl);
+    if (!res.ok) throw new Error(`Could not read the image (${res.status}).`);
+    const blob = await res.blob();
+    const file = new File([blob], imageName || 'texture.png', { type: blob.type || 'image/png' });
+    const entry = await loadCustomTexture(file);
+    entry.isCustom = true;
+    _useCustomMap(entry, !keepScale);
+  } else {
+    throw new Error('Give a preset name or an image path.');
+  }
+  _scheduleUndoCapture();
+  await _agentIdle();
+  return { texture: activeMapEntry?.name ?? null, settings: _agentSettings() };
+}
+
+async function _agentLoadModel({ url, fileName, stepPreset }) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Could not read the model (${res.status}).`);
+  const blob = await res.blob();
+  const file = new File([blob], fileName, { type: 'application/octet-stream' });
+  if (/\.(step|stp)$/i.test(fileName)) {
+    const p = handleModelFile(file);       // opens the STEP dialog
+    await p;
+    await _agentWait(50);
+    if (stepPreset) {
+      const radio = document.querySelector(`input[name="step-preset"][value="${stepPreset}"]`);
+      if (radio) { radio.checked = true; _stepUpdateFields(); }
+    }
+    stepImportGo.click();
+    // wait for the import to land
+    const t0 = Date.now();
+    const before = currentGeometry;
+    while (currentGeometry === before && Date.now() - t0 < 180_000) await _agentWait(150);
+  } else {
+    await handleModelFile(file);
+  }
+  if (!currentGeometry) throw new Error('The model did not load.');
+  await _agentIdle();
+  return _agentStatus();
+}
+
+function _agentFacesNear(point, count = 1) {
+  const pos = currentGeometry.attributes.position.array;
+  const p = _agentToWork(point);
+  let best = -1, bestD = Infinity;
+  for (let f = 0, i = 0; i < pos.length; f++, i += 9) {
+    const d = distSqPointToTri(p.x, p.y, p.z,
+      pos[i], pos[i + 1], pos[i + 2], pos[i + 3], pos[i + 4], pos[i + 5], pos[i + 6], pos[i + 7], pos[i + 8]);
+    if (d < bestD) { bestD = d; best = f; }
+  }
+  return { face: best, distance: Math.sqrt(bestD) };
+}
+
+function _agentFaceSelect(sel) {
+  const pos = currentGeometry.attributes.position.array;
+  const n = (pos.length / 9) | 0;
+  const out = new Set();
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const nrm = new THREE.Vector3(), cen = new THREE.Vector3();
+  const rotInv = currentPoseRot.clone().invert();
+  let dir = null, cosLim = 0;
+  if (sel.normal) {
+    dir = new THREE.Vector3(...sel.normal).normalize();
+    cosLim = Math.cos(THREE.MathUtils.degToRad(sel.withinDeg ?? 10));
+  }
+  for (let f = 0; f < n; f++) {
+    const i = f * 9;
+    a.set(pos[i], pos[i + 1], pos[i + 2]); b.set(pos[i + 3], pos[i + 4], pos[i + 5]); c.set(pos[i + 6], pos[i + 7], pos[i + 8]);
+    if (dir) {
+      nrm.subVectors(c, b).cross(new THREE.Vector3().subVectors(a, b)).normalize().applyQuaternion(rotInv);
+      if (nrm.dot(dir) < cosLim) continue;
+    }
+    if (sel.box) {
+      cen.copy(a).add(b).add(c).multiplyScalar(1 / 3);
+      const o = _agentFromWork(cen);
+      const { min, max } = sel.box;
+      if (o.x < min[0] || o.y < min[1] || o.z < min[2] || o.x > max[0] || o.y > max[1] || o.z > max[2]) continue;
+    }
+    out.add(f);
+  }
+  return out;
+}
+
+async function _agentMask({ action = 'paint', mode, near, spreadDeg, normal, withinDeg, box, erase = false }) {
+  if (!currentGeometry || !paintTree) throw new Error('Load a model first.');
+  if (mode) {
+    maskModeChosen = true;
+    setSelectionMode(mode === 'include', { clear: true });
+    updateMaskModeButtons();
+  }
+  if (action === 'clear') {
+    paintTree.clearLayer(_activeSlot());
+    refreshExclusionOverlay();
+  } else if (action === 'paint') {
+    let faces;
+    let seed = null;
+    if (near) {
+      seed = _agentFacesNear(near);
+      if (seed.face < 0) throw new Error('No face near that point.');
+      faces = bucketFill(seed.face, triangleAdjacency, spreadDeg ?? bucketThreshold);
+    } else if (normal || box) {
+      faces = _agentFaceSelect({ normal, withinDeg, box });
+    } else {
+      throw new Error('Say which faces: near (a point), normal (a direction), or box.');
+    }
+    paintTree.paintFaces(_activeSlot(), faces, !!erase);
+    refreshExclusionOverlay();
+    _scheduleUndoCapture();
+    await _agentIdle();
+    return { painted: faces.size, erase: !!erase, seedDistanceMm: seed ? +seed.distance.toFixed(3) : undefined, layer: _agentLayers()[activeLayer] };
+  } else {
+    throw new Error("action is 'paint' or 'clear'");
+  }
+  _scheduleUndoCapture();
+  return { layer: _agentLayers()[activeLayer] };
+}
+
+async function _agentLayer({ action, index, visible, blend }) {
+  switch (action) {
+    case 'list': break;
+    case 'add': _addLayer(); break;
+    case 'activate': _activateLayer(index); break;
+    case 'remove': _removeLayer(index); break;
+    case 'visible': _setLayerVisible(index, !!visible); break;
+    case 'blend': _setLayerBlendAdd(index, blend === 'add'); break;
+    default: throw new Error("action is list | add | activate | remove | visible | blend");
+  }
+  if (action !== 'list') _scheduleUndoCapture();
+  await _agentIdle();
+  return { layers: _agentLayers() };
+}
+
+async function _agentPreview({ enabled }) {
+  if (!currentGeometry) throw new Error('Load a model first.');
+  dispPreviewToggle.checked = !!enabled;
+  dispPreviewToggle.dispatchEvent(new Event('change', { bubbles: true }));
+  const idle = await _agentIdle(300_000);
+  return { preview3d: !!settings.useDisplacement, finished: idle };
+}
+
+const _AGENT_VIEWS = {
+  iso: [1, -1, 0.8], front: [0, -1, 0], back: [0, 1, 0], left: [-1, 0, 0], right: [1, 0, 0],
+  top: [0, 0.0001, 1], bottom: [0, 0.0001, -1],
+};
+
+async function _agentRender({ view = 'iso', direction, maxSize = 1024 } = {}) {
+  const mesh = getCurrentMesh();
+  if (!mesh) throw new Error('Load a model first.');
+  const cam = getCamera(), controls = getControls(), renderer = getRenderer();
+  const box = new THREE.Box3().setFromObject(mesh);
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const d = new THREE.Vector3(...(direction || _AGENT_VIEWS[view] || _AGENT_VIEWS.iso)).normalize();
+  const fov = cam.isPerspectiveCamera ? THREE.MathUtils.degToRad(cam.fov) : Math.PI / 4;
+  const dist = sphere.radius / Math.sin(fov / 2) * 1.15;
+  cam.up.set(0, 0, 1);
+  cam.position.copy(sphere.center).addScaledVector(d, dist);
+  controls.target.copy(sphere.center);
+  if (cam.isOrthographicCamera) { cam.zoom = 1; cam.updateProjectionMatrix(); }
+  controls.update();
+  renderer.render(getScene(), cam);
+  const src = renderer.domElement;
+  const scale = Math.min(1, maxSize / Math.max(src.width, src.height));
+  const out = document.createElement('canvas');
+  out.width = Math.round(src.width * scale); out.height = Math.round(src.height * scale);
+  out.getContext('2d').drawImage(src, 0, 0, out.width, out.height);
+  requestRender();
+  const dataUrl = out.toDataURL('image/png');
+  return { mimeType: 'image/png', base64: dataUrl.slice(dataUrl.indexOf(',') + 1), view, preview3d: !!settings.useDisplacement };
+}
+
+async function _agentExport({ format = 'stl', uploadUrl }) {
+  if (!currentGeometry) throw new Error('Load a model first.');
+  if (!_hasTexturedLayer()) throw new Error('Nothing is textured yet — pick a texture.');
+  let captured = null;
+  const origClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function () {
+    if (this.download && this.href.startsWith('blob:')) { captured = { href: this.href, name: this.download }; return; }
+    return origClick.call(this);
+  };
+  const t0 = Date.now();
+  try {
+    await handleExport(format === '3mf' ? '3mf' : 'stl');
+  } finally {
+    HTMLAnchorElement.prototype.click = origClick;
+  }
+  if (!captured) {
+    const last = _agentLog.at(-1);
+    throw new Error('The export produced no file' + (last ? `: ${last.text}` : '.'));
+  }
+  const blob = await (await fetch(captured.href)).blob();
+  const res = await fetch(uploadUrl, { method: 'PUT', body: blob });
+  if (!res.ok) throw new Error(`Could not hand the file to the agent's server (${res.status}).`);
+  return {
+    fileName: captured.name,
+    bytes: blob.size,
+    triangles: format === '3mf' ? undefined : Math.max(0, (blob.size - 84) / 50),
+    seconds: +((Date.now() - t0) / 1000).toFixed(1),
+    warnings: triLimitWarning.classList.contains('hidden') ? [] : [triLimitWarning.textContent],
+  };
+}
+
+// For contract tests: what the export would feed the pipeline right now —
+// the engine (engine/index.js) must turn the same inputs into the same mesh.
+function _agentFnv(arr) {
+  if (!arr) return null;
+  const b = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  let h = 2166136261;
+  for (let i = 0; i < b.length; i++) { h ^= b[i]; h = Math.imul(h, 16777619) >>> 0; }
+  return h.toString(16);
+}
+async function _agentPipelineInputs() {
+  if (!currentGeometry) throw new Error('Load a model first.');
+  const i = _pipelineInputs();
+  const s = _owSettings(settings);
+  return {
+    positions: { count: i.positions.length, fnv: _agentFnv(i.positions) },
+    faceWeights: i.faceWeights ? { count: i.faceWeights.length, fnv: _agentFnv(i.faceWeights), ones: i.faceWeights.reduce((a, v) => a + (v > 0.99 ? 1 : 0), 0) } : null,
+    image: i.imageData ? { w: i.imgWidth, h: i.imgHeight, fnv: _agentFnv(i.imageData.data) } : null,
+    layered: !!i.layers,
+    settings: JSON.parse(JSON.stringify(s)),
+    bounds: currentBounds ? { min: currentBounds.min, max: currentBounds.max } : null,
+    pose: { rot: currentPoseRot.toArray(), trans: currentPoseTrans.toArray() },
+  };
+}
+
+const AGENT_COMMANDS = {
+  status: async () => _agentStatus(),
+  load_model: _agentLoadModel,
+  list_textures: async (a) => _agentTextures(a),
+  set_texture: _agentSetTexture,
+  get_settings: async () => ({ settings: _agentSettings(), meaning: _AGENT_SETTING_DOC }),
+  set_settings: async ({ settings: s }) => ({ settings: await _agentSetSettings(s) }),
+  mask: _agentMask,
+  layer: _agentLayer,
+  preview: _agentPreview,
+  render: _agentRender,
+  export: _agentExport,
+  pipeline_inputs: _agentPipelineInputs,
+  // Stops an export (or a 3D preview build) that is running; answered at once, past the queue.
+  cancel: async () => {
+    const was = { exporting: isExporting, previewBuilding: _agentBusy().previewBuilding };
+    if (isExporting) exportToken++;
+    if (was.previewBuilding) cancelDisplacementPreviewBuild();
+    await _agentWait(100);
+    return { cancelled: was.exporting || was.previewBuilding, ...was };
+  },
+  undo: async () => { _undo(); await _agentIdle(); return _agentStatus(); },
+  redo: async () => { _redo(); await _agentIdle(); return _agentStatus(); },
+};
+
+(function _startAgentLinkIfPaired() {
+  const m = /(?:^#|&)agent=(\d{1,5}):([A-Za-z0-9_-]{8,})/.exec(location.hash);
+  let pair = null;
+  if (m) {
+    pair = { port: Number(m[1]), token: m[2] };
+    try { localStorage.setItem('bumpmesh.agent', JSON.stringify(pair)); } catch {}
+    history.replaceState(null, '', location.pathname + location.search);
+  } else {
+    try { pair = JSON.parse(localStorage.getItem('bumpmesh.agent') || 'null'); } catch {}
+  }
+  if (!pair) return;
+  // Alerts would block the page while an agent drives it: log them instead.
+  const origAlert = window.alert.bind(window);
+  window.alert = (msg) => { _agentNote('alert', msg); console.warn('[agent] alert:', msg); };
+  window.__bumpmeshAlert = origAlert;
+  import('./agentBridge.js').then(({ startAgentBridge }) => startAgentBridge(pair, AGENT_COMMANDS, { version: APP_VERSION, immediate: ['status', 'cancel', 'list_textures', 'get_settings'] }));
+})();

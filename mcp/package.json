@@ -1,0 +1,11 @@
+{
+  "name": "bumpmesh-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Drive BumpMesh (CNC Kitchen) from an AI agent: a local MCP server that serves the app and talks to its tab.",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "bin": { "bumpmesh-mcp": "bin/bumpmesh-mcp.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "@modelcontextprotocol/sdk": "1.32.1", "ws": "8.22.0" }
+}
