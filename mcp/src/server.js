@@ -23,6 +23,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { TOOLS } from './tools.js'
+import { maskPaint } from './masks.js'
 
 export const VERSION = '0.2.0'
 /** The page's link protocol this server speaks (js/agentBridge.js PROTOCOL). */
@@ -383,27 +384,7 @@ async function textureFileHeadless({ path: input, output, layers, settings = {},
       for (let i = 0; i < positions.length; i += 3) for (let k = 0; k < 3; k++) { mins[k] = Math.min(mins[k], positions[i + k]); maxs[k] = Math.max(maxs[k], positions[i + k]) }
       s.scaleU = s.scaleV = parseFloat((defaultScale * Math.max(...maxs.map((m, k) => m - mins[k]))).toPrecision(3))
     }
-    let mask = null
-    if (L.mask) {
-      const { mode = 'exclude', box, facing, angleDeg = 30 } = L.mask
-      if (!box && !facing) throw new Error('Headless masks are a box and/or a facing direction: { mode, box: { min, max }, facing, angleDeg }.')
-      const paint = new Float32Array(tri * 3)
-      const f = facing ? (() => { const l = Math.hypot(...facing); return facing.map((x) => x / l) })() : null
-      const cos = Math.cos((angleDeg * Math.PI) / 180)
-      for (let t = 0; t < tri; t++) {
-        const p = positions.subarray(t * 9, t * 9 + 9)
-        let ok = true
-        if (f) {
-          const ux = p[3] - p[0], uy = p[4] - p[1], uz = p[5] - p[2], vx = p[6] - p[0], vy = p[7] - p[1], vz = p[8] - p[2]
-          const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx
-          const l = Math.hypot(nx, ny, nz) || 1
-          ok = (nx * f[0] + ny * f[1] + nz * f[2]) / l >= cos
-        }
-        if (ok && box) for (let c = 0; c < 3 && ok; c++) for (let k = 0; k < 3; k++) if (p[c * 3 + k] < box.min[k] || p[c * 3 + k] > box.max[k]) ok = false
-        if (ok) paint.fill(1, t * 3, t * 3 + 3)
-      }
-      mask = { mode, paint }
-    }
+    const mask = L.mask ? { mode: L.mask.mode || 'exclude', paint: await maskPaint(positions, L.mask, (f) => requireFile(f, 'Mask')) } : null
     built.push({ image: prepareMap(image, s), settings: s, mask, blendAdd: L.blend === 'add' })
   }
   if (settings.refineLength == null) {

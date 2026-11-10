@@ -126,7 +126,7 @@ export const TOOLS = [
   {
     name: 'bumpmesh_texture_file',
     description:
-      'Texture an STL file with no browser at all — BumpMesh\'s engine in this process, the same code the page exports with — and write STL or 3MF. For a batch or a quick job; the page (bumpmesh_load_model …) is the way to look at it first. Each layer: { texture: library name | image: PNG path, settings: { textureHeight, scaleU, mappingMode, … as bumpmesh_get_settings lists }, mask: { mode: exclude|include, box: { min, max }, facing: [x,y,z], angleDeg } }. settings: the output\'s own (refineLength — default the part\'s diagonal/250 —, maxTriangles, bottomAngleLimit, topAngleLimit, preserveUntextured …).',
+      'Texture an STL file with no browser at all — BumpMesh\'s engine in this process, the same code the page exports with — and write STL or 3MF. For a batch or a quick job; the page (bumpmesh_load_model …) is the way to look at it first. Each layer: { texture: library name | image: PNG path, settings: { textureHeight, scaleU, mappingMode, … as bumpmesh_get_settings lists }, mask: { mode: exclude|include, box: { min, max }, facing: [x,y,z], angleDeg, triangles: [index …] | trianglesFile: a JSON { triangles, stlTriangles } a CAD host wrote with the STL (FreeCAD's texture_prepare) } }. settings: the output\'s own (refineLength — default the part\'s diagonal/250 —, maxTriangles, bottomAngleLimit, topAngleLimit, preserveUntextured …).',
     inputSchema: {
       type: 'object',
       required: ['path', 'output', 'layers'],
