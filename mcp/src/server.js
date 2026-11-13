@@ -275,11 +275,11 @@ async function waitForPage(ms) {
 const fsUrl = (p) => `/fs?token=${encodeURIComponent(CFG.token)}&path=${encodeURIComponent(p)}`
 const json = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] })
 
-async function requireFile(p, kind) {
+async function requireFile(p, kind, ext = READ_EXT) {
   const file = expand(p)
   const st = await fsp.stat(file).catch(() => null)
   if (!st || !st.isFile()) throw new Error(`${kind} not found: ${file}`)
-  if (!READ_EXT.test(file)) throw new Error(`${file} is not a model or image this tool reads.`)
+  if (!ext.test(file)) throw new Error(`${file} is not a ${kind === 'Mask' ? 'mask (.json)' : 'model or image'} this tool reads.`)
   return file
 }
 
@@ -384,7 +384,7 @@ async function textureFileHeadless({ path: input, output, layers, settings = {},
       for (let i = 0; i < positions.length; i += 3) for (let k = 0; k < 3; k++) { mins[k] = Math.min(mins[k], positions[i + k]); maxs[k] = Math.max(maxs[k], positions[i + k]) }
       s.scaleU = s.scaleV = parseFloat((defaultScale * Math.max(...maxs.map((m, k) => m - mins[k]))).toPrecision(3))
     }
-    const mask = L.mask ? { mode: L.mask.mode || 'exclude', paint: await maskPaint(positions, L.mask, (f) => requireFile(f, 'Mask')) } : null
+    const mask = L.mask ? { mode: L.mask.mode || 'exclude', paint: await maskPaint(positions, L.mask, (f) => requireFile(f, 'Mask', /\.json$/i)) } : null
     built.push({ image: prepareMap(image, s), settings: s, mask, blendAdd: L.blend === 'add' })
   }
   if (settings.refineLength == null) {
