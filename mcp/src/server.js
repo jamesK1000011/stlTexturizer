@@ -16,7 +16,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -283,7 +283,45 @@ async function requireFile(p, kind, ext = READ_EXT) {
   return file
 }
 
+// Self-update: the clone this server runs from, brought up to its branch on
+// the fork (fast-forward only), then every running copy stopped so Claude
+// starts the server again on the new code.
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+const UPDATE_URL = process.env.BUMPMESH_UPDATE_URL || 'https://github.com/jamesK1000011/stlTexturizer.git'
+const UPDATE_BRANCH = process.env.BUMPMESH_UPDATE_BRANCH || 'agent-link'
+
+function git(args) {
+  const r = spawnSync('git', ['-C', REPO, ...args], { encoding: 'utf8', timeout: 120000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })
+  return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || r.error?.message || '').trim().split('\n').pop() }
+}
+
+function selfUpdate() {
+  if (!fs.existsSync(path.join(REPO, '.git'))) throw new Error(`${REPO} is not a git clone: update it the way it was installed.`)
+  const f = git(['fetch', '--quiet', UPDATE_URL, UPDATE_BRANCH])
+  if (!f.ok) throw new Error(`could not fetch ${UPDATE_BRANCH}: ${f.err}`)
+  const before = git(['rev-parse', '--short', 'HEAD']).out
+  if (git(['rev-parse', '--abbrev-ref', 'HEAD']).out !== UPDATE_BRANCH) {
+    const sw = git(['switch', UPDATE_BRANCH])
+    if (!sw.ok && !git(['switch', '-c', UPDATE_BRANCH, 'FETCH_HEAD']).ok) throw new Error(`could not switch to ${UPDATE_BRANCH}: ${sw.err}`)
+  }
+  const m = git(['merge', '--ff-only', 'FETCH_HEAD'])
+  if (!m.ok) throw new Error(`left as it is — the clone has work of its own (${m.err})`)
+  return { before, after: git(['rev-parse', '--short', 'HEAD']).out }
+}
+
 const HANDLERS = {
+  async bumpmesh_update() {
+    const { before, after } = selfUpdate()
+    if (before === after) return json({ before, after, restarted: false, note: 'Already the newest: nothing to do.' })
+    // Answer first, then go: every copy of this server (one may hold the
+    // page's port and relay for the rest) stops, and Claude starts it again.
+    setTimeout(() => {
+      spawnSync('pkill', ['-f', path.join(REPO, 'mcp') + '/'], { timeout: 10000 })
+      process.exit(0)
+    }, 300)
+    return json({ before, after, restarted: true, note: 'BumpMesh starts again on the new code in a few seconds; its tools are listed again when Claude reconnects. A connected BumpMesh tab reconnects by itself or with bumpmesh_open.' })
+  },
+
   async bumpmesh_open({ launch = true } = {}) {
     if (link.connected) return json({ connected: true, url: `${BASE}/`, note: 'A BumpMesh tab is already connected.' })
     const url = pairingUrl()

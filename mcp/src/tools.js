@@ -10,6 +10,11 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: { launch: { type: 'boolean', description: 'Open the browser (default true).' } } },
   },
   {
+    name: 'bumpmesh_update',
+    description: 'Bring this BumpMesh server up to the newest of its branch on GitHub and start it again on it, without restarting Claude: fetched into the git clone it runs from (fast-forward only; a clone with work of its own is left as it is and said). Answers the commit before and after; Claude reconnects in a few seconds and lists the tools again.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'bumpmesh_status',
     description: 'Whether a BumpMesh tab is connected; the loaded model (name, triangles, bounds in the file\'s own mm), active texture, layers and their masks, preview state, busy flags, and recent warnings the page raised.',
     inputSchema: { type: 'object', properties: {} },
